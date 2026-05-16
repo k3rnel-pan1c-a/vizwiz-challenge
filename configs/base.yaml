@@ -25,11 +25,18 @@ output:
 # Model
 # ---------------------------------------------------------------
 model:
-  backbone: "Qwen/Qwen2.5-VL-7B-Instruct"
-  # dtype for backbone weights. T4 GPUs → float16. Ampere+ → bfloat16.
-  torch_dtype: "float16"
-  # d_vlm: hidden dim of backbone (3584 for 7B). Set to null to auto-detect.
-  d_vlm: 3584
+  backbone: "Qwen/Qwen2.5-VL-3B-Instruct"
+  # Backbone dtype for Qwen. Keep BF16 for numerical stability.
+  torch_dtype: "bfloat16"
+  # Spread the HF backbone across all visible GPUs instead of fitting greedily on cuda:0.
+  device_map: "balanced"
+  max_memory_per_gpu: "13GiB"
+  # SDPA avoids materializing the full eager attention matrix when supported.
+  attn_implementation: "sdpa"
+  # Cap image resolution before Qwen's vision tower to avoid attention OOMs.
+  max_pixels: 262144
+  # null = auto-detect from model config (recommended — works for any model size)
+  d_vlm: null
   # d_dec: hidden dim inside the DETR decoder
   d_dec: 256
   # Number of DETR object queries — override dataset-derived N here or set to null

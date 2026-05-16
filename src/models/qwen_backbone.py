@@ -22,7 +22,7 @@ Optional LoRA support (requires peft):
 from __future__ import annotations
 
 import warnings
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 import torch.nn as nn
@@ -43,19 +43,26 @@ class QwenBackbone(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct",
         freeze: bool = True,
         torch_dtype: torch.dtype = torch.bfloat16,
-        device_map: str | None = "auto",
+        device_map: str | dict | None = "auto",
+        max_memory: dict[int, str] | None = None,
         attn_implementation: str = "eager",
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
     ) -> None:
         super().__init__()
 
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        processor_kwargs: dict[str, Any] = {"trust_remote_code": True}
+        if min_pixels is not None:
+            processor_kwargs["min_pixels"] = min_pixels
+        if max_pixels is not None:
+            processor_kwargs["max_pixels"] = max_pixels
+
+        self.processor = AutoProcessor.from_pretrained(model_name, **processor_kwargs)
 
         model_kwargs: dict = {
             "torch_dtype": torch_dtype,
@@ -64,6 +71,8 @@ class QwenBackbone(nn.Module):
         }
         if device_map is not None:
             model_kwargs["device_map"] = device_map
+        if max_memory is not None:
+            model_kwargs["max_memory"] = max_memory
 
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
@@ -83,6 +92,8 @@ class QwenBackbone(nn.Module):
 
         if freeze:
             self._freeze()
+
+        _print_device_map_summary(self.model)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -201,6 +212,24 @@ class QwenBackbone(nn.Module):
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
+
+
+def _print_device_map_summary(model: nn.Module) -> None:
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = "unknown"
+        print(f"Backbone device map: single device ({device})")
+        return
+
+    counts: dict[str, int] = {}
+    for device in device_map.values():
+        key = str(device)
+        counts[key] = counts.get(key, 0) + 1
+    summary = ", ".join(f"{device}: {count} modules" for device, count in sorted(counts.items()))
+    print(f"Backbone device map: {summary}")
 
 def _build_messages(images: list, questions: list[str]) -> list[list[dict]]:
     """Build Qwen2.5-VL chat messages for each image-question pair."""

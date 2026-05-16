@@ -105,7 +105,8 @@ class GroundingLoss(torch.nn.Module):
                 continue
 
             pb_matched = pred_boxes[b][pred_idx]              # [M, 4] cxcywh
-            gt_matched = gt_boxes_list[b][gt_idx].to(device)  # [M, 4] cxcywh
+            gt_boxes = gt_boxes_list[b].to(device)
+            gt_matched = gt_boxes[gt_idx]                      # [M, 4] cxcywh
 
             # L1 loss on normalized cxcywh
             l1_losses.append(F.l1_loss(pb_matched, gt_matched, reduction="sum"))

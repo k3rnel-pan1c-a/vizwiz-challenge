@@ -107,11 +107,20 @@ def build_model(cfg: dict, device: torch.device) -> tuple[QwenBackbone, Groundin
     _dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = _dtype_map.get(m.get("torch_dtype", "float16"), torch.float16)
 
+    max_memory = None
+    max_memory_per_gpu = m.get("max_memory_per_gpu")
+    if max_memory_per_gpu and torch.cuda.is_available():
+        max_memory = {i: max_memory_per_gpu for i in range(torch.cuda.device_count())}
+
     backbone = QwenBackbone(
         model_name=m["backbone"],
         freeze=m.get("freeze_backbone", True),
         torch_dtype=torch_dtype,
-        device_map="auto",
+        device_map=m.get("device_map", "auto"),
+        max_memory=max_memory,
+        attn_implementation=m.get("attn_implementation", "eager"),
+        max_pixels=m.get("max_pixels"),
+        min_pixels=m.get("min_pixels"),
     )
 
     d_vlm = m.get("d_vlm") or backbone.d_vlm
@@ -255,15 +264,14 @@ def train_epoch(
     global_step: list[int] | None = None,
 ) -> float:
     head.train()
-    if not backbone.model.training:
-        # Backbone may be frozen; ensure head is in train mode
-        pass
+    backbone.eval()
 
     total_loss = 0.0
     n_batches = 0
     optimizer.zero_grad()
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False)
+    head_dtype = next(head.parameters()).dtype
     for step, batch in enumerate(pbar):
         images    = batch["images"]
         questions = batch["questions"]
@@ -272,7 +280,8 @@ def train_epoch(
 
         # ---- Forward through frozen backbone ----
         hidden, key_pad = backbone(images, questions, device=device)
-        hidden  = hidden.to(device)
+        hidden  = hidden.to(device=device, dtype=head_dtype)
+        hidden = _check_nonfinite(hidden, name="backbone hidden states")
         key_pad = key_pad.to(device)
 
         # ---- Grounding head ----
@@ -294,6 +303,13 @@ def train_epoch(
             match_result=match,
         )
         loss = loss_dict.total / grad_accum
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Loss is {loss.item()} at epoch={epoch} step={step}. "
+                f"Check for NaN in backbone hidden states (set torch_dtype: bfloat16)."
+            )
+
         loss.backward()
 
         if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
@@ -356,11 +372,13 @@ def val_epoch(
     global_step: int = 0,
 ) -> tuple[float, dict]:
     head.eval()
+    backbone.eval()
     total_loss = 0.0
     n_batches  = 0
     metrics = GroundingMetrics(iou_thresholds=iou_thresholds, obj_threshold=obj_threshold)
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [val]", leave=False)
+    head_dtype = next(head.parameters()).dtype
     for batch in pbar:
         images    = batch["images"]
         questions = batch["questions"]
@@ -368,7 +386,8 @@ def val_epoch(
         sm_labels = batch["single_multi"].to(device)
 
         hidden, key_pad = backbone(images, questions, device=device)
-        hidden  = hidden.to(device)
+        hidden  = hidden.to(device=device, dtype=head_dtype)
+        hidden = _check_nonfinite(hidden, name="backbone hidden states")
         key_pad = key_pad.to(device)
 
         out = head(hidden, key_padding_mask=key_pad)
@@ -577,6 +596,24 @@ def main() -> None:
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
+
+
+def _check_nonfinite(x: torch.Tensor, name: str) -> torch.Tensor:
+    """Abort if more than 1% of values are non-finite; warn and clamp otherwise."""
+    mask = ~torch.isfinite(x)
+    if not mask.any():
+        return x
+    bad = int(mask.sum())
+    frac = bad / x.numel()
+    if frac > 0.01:
+        raise RuntimeError(
+            f"{name} has {bad}/{x.numel()} ({frac*100:.1f}%) non-finite values. "
+            f"This is catastrophic — training on zeroed features is useless.\n"
+            f"Fix: set  model.torch_dtype: bfloat16  in configs/base.yaml.\n"
+            f"Qwen2.5-VL overflows in float16; bfloat16 uses fp32 compute on T4."
+        )
+    print(f"Warning: {bad} non-finite values ({frac*100:.2f}%) in {name}, clamping.")
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
 def _flatten_dict(d: dict, out: dict, prefix: str = "") -> None:
     for k, v in d.items():

@@ -127,6 +127,16 @@ class HungarianMatcher(torch.nn.Module):
                 + self.lambda_obj  * cost_obj
             )   # [N, K]
 
+            if not torch.isfinite(cost).all():
+                bad = (~torch.isfinite(cost)).sum().item()
+                raise ValueError(
+                    f"Hungarian cost contains {bad} non-finite values "
+                    f"for batch item {b}; "
+                    f"pred_boxes finite={torch.isfinite(pb).all().item()}, "
+                    f"pred_obj finite={torch.isfinite(pol).all().item()}, "
+                    f"gt_boxes finite={torch.isfinite(gt_b).all().item()}"
+                )
+
             # ---- Solve assignment ----
             cost_np = cost.cpu().float().numpy()
             row_ind, col_ind = linear_sum_assignment(cost_np)
