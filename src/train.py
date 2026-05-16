@@ -33,7 +33,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -247,8 +246,6 @@ def train_epoch(
     scheduler,
     loader: DataLoader,
     device: torch.device,
-    scaler: GradScaler | None,
-    mixed_precision: str,
     grad_accum: int,
     grad_clip: float,
     log_every: int,
@@ -273,52 +270,35 @@ def train_epoch(
         gt_boxes  = batch["gt_boxes"]       # list of tensors
         sm_labels = batch["single_multi"].to(device)  # Long[B]
 
-        amp_dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
-        use_amp = mixed_precision in ("fp16", "bf16")
-        amp_ctx = autocast(dtype=amp_dtype) if use_amp else _null_ctx()
+        # ---- Forward through frozen backbone ----
+        hidden, key_pad = backbone(images, questions, device=device)
+        hidden  = hidden.to(device)
+        key_pad = key_pad.to(device)
 
-        with amp_ctx:
-            # ---- Forward through frozen backbone ----
-            hidden, key_pad = backbone(images, questions, device=device)
-            hidden  = hidden.to(device)
-            key_pad = key_pad.to(device)
+        # ---- Grounding head ----
+        out = head(hidden, key_padding_mask=key_pad)
+        pred_boxes  = out["pred_boxes"]
+        pred_obj    = out["pred_obj_logits"]
+        pred_sm     = out["pred_single_multi_logits"]
 
-            # ---- Grounding head ----
-            out = head(hidden, key_padding_mask=key_pad)
-            pred_boxes  = out["pred_boxes"]
-            pred_obj    = out["pred_obj_logits"]
-            pred_sm     = out["pred_single_multi_logits"]
+        # ---- Hungarian matching (no_grad internally) ----
+        match = matcher(pred_boxes.float(), pred_obj.float(), gt_boxes)
 
-            # ---- Hungarian matching (no_grad internally) ----
-            match = matcher(pred_boxes.float(), pred_obj.float(), gt_boxes)
-
-            # ---- Loss ----
-            loss_dict = criterion(
-                pred_boxes=pred_boxes.float(),
-                pred_obj_logits=pred_obj.float(),
-                pred_sm_logits=pred_sm.float(),
-                gt_boxes_list=gt_boxes,
-                sm_labels=sm_labels,
-                match_result=match,
-            )
-            loss = loss_dict.total / grad_accum
-
-        if use_amp:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # ---- Loss ----
+        loss_dict = criterion(
+            pred_boxes=pred_boxes.float(),
+            pred_obj_logits=pred_obj.float(),
+            pred_sm_logits=pred_sm.float(),
+            gt_boxes_list=gt_boxes,
+            sm_labels=sm_labels,
+            match_result=match,
+        )
+        loss = loss_dict.total / grad_accum
+        loss.backward()
 
         if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
-            if use_amp:
-                scaler.unscale_(optimizer)
-
             nn.utils.clip_grad_norm_(head.parameters(), grad_clip)
-
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
 
             scheduler.step()
             optimizer.zero_grad()
@@ -535,11 +515,6 @@ def main() -> None:
 
     scheduler = build_scheduler(cfg, optimizer, total_steps)
 
-    # ---- Mixed precision ----
-    mp = cfg["training"].get("mixed_precision", "no")
-    # fp16: needs GradScaler to prevent underflow; bf16: stable enough without one
-    scaler = GradScaler("cuda") if mp == "fp16" else None
-
     # ---- Resume ----
     start_epoch = 0
     if args.resume:
@@ -571,8 +546,8 @@ def main() -> None:
         train_loss = train_epoch(
             backbone=backbone, head=head, matcher=matcher, criterion=criterion,
             optimizer=optimizer, scheduler=scheduler, loader=train_loader,
-            device=device, scaler=scaler, mixed_precision=mp,
-            grad_accum=grad_accum, grad_clip=grad_clip, log_every=log_every,
+            device=device, grad_accum=grad_accum,
+            grad_clip=grad_clip, log_every=log_every,
             epoch=epoch, writer=writer, wandb_run=wandb_run, global_step=global_step,
         )
         print(f"[Epoch {epoch:3d}] train_loss={train_loss:.4f}")
@@ -602,11 +577,6 @@ def main() -> None:
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
-
-class _null_ctx:
-    def __enter__(self): return self
-    def __exit__(self, *_): pass
-
 
 def _flatten_dict(d: dict, out: dict, prefix: str = "") -> None:
     for k, v in d.items():

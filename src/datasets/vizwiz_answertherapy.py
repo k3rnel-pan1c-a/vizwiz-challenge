@@ -262,7 +262,7 @@ def build_datasets(
 
     if cfg["data"].get("train_json_extra"):
         train_jsons.append(root / cfg["data"]["train_json_extra"])
-        train_dirs.append(val_img_dir)   # VQA images live in the val/COCO folder
+        train_dirs.append(train_img_dir)
     if cfg["data"].get("val_json_extra"):
         val_jsons.append(root / cfg["data"]["val_json_extra"])
         val_dirs.append(val_img_dir)

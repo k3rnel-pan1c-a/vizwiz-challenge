@@ -111,7 +111,7 @@ class QwenBackbone(nn.Module):
         messages = _build_messages(images, questions)
         texts = [
             self.processor.apply_chat_template(
-                [msg], tokenize=False, add_generation_prompt=True
+                msg, tokenize=False, add_generation_prompt=True
             )
             for msg in messages
         ]

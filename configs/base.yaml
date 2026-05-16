@@ -64,8 +64,6 @@ training:
   num_workers: 2
   # Gradient accumulation steps (effective_bs = batch_size * grad_accum)
   grad_accum_steps: 4
-  # Mixed precision: "fp16" for T4/V100, "bf16" for A100/H100, "no" to disable
-  mixed_precision: "fp16"
   # Gradient clipping max norm
   grad_clip: 1.0
 
