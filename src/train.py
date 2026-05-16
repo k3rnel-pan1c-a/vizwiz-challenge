@@ -33,7 +33,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -105,10 +105,13 @@ def build_model(cfg: dict, device: torch.device) -> tuple[QwenBackbone, Groundin
     m = cfg["model"]
     abl = cfg.get("ablation", {})
 
+    _dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    torch_dtype = _dtype_map.get(m.get("torch_dtype", "float16"), torch.float16)
+
     backbone = QwenBackbone(
         model_name=m["backbone"],
         freeze=m.get("freeze_backbone", True),
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         device_map="auto",
     )
 
@@ -245,6 +248,7 @@ def train_epoch(
     loader: DataLoader,
     device: torch.device,
     scaler: GradScaler | None,
+    mixed_precision: str,
     grad_accum: int,
     grad_clip: float,
     log_every: int,
@@ -269,8 +273,9 @@ def train_epoch(
         gt_boxes  = batch["gt_boxes"]       # list of tensors
         sm_labels = batch["single_multi"].to(device)  # Long[B]
 
-        use_amp = scaler is not None
-        amp_ctx = autocast(dtype=torch.bfloat16) if use_amp else _null_ctx()
+        amp_dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
+        use_amp = mixed_precision in ("fp16", "bf16")
+        amp_ctx = autocast(dtype=amp_dtype) if use_amp else _null_ctx()
 
         with amp_ctx:
             # ---- Forward through frozen backbone ----
@@ -445,7 +450,12 @@ def main() -> None:
     parser.add_argument("--config", default="configs/base.yaml")
     parser.add_argument("--overrides", nargs="*", default=[])
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
-    args = parser.parse_args()
+    # parse_known_args lets users pass bare key=value overrides without --overrides:
+    #   python src/train.py --config configs/base.yaml training.epochs=5
+    args, extra = parser.parse_known_args()
+    # Merge explicit --overrides and any bare key=value extras
+    all_overrides = (args.overrides or []) + [e for e in extra if "=" in e]
+    args.overrides = all_overrides
 
     cfg = load_config(args.config, args.overrides)
 
@@ -527,8 +537,8 @@ def main() -> None:
 
     # ---- Mixed precision ----
     mp = cfg["training"].get("mixed_precision", "no")
-    scaler = GradScaler() if mp == "fp16" else None
-    # bf16 handled via autocast ctx; no scaler needed
+    # fp16: needs GradScaler to prevent underflow; bf16: stable enough without one
+    scaler = GradScaler("cuda") if mp == "fp16" else None
 
     # ---- Resume ----
     start_epoch = 0
@@ -561,9 +571,9 @@ def main() -> None:
         train_loss = train_epoch(
             backbone=backbone, head=head, matcher=matcher, criterion=criterion,
             optimizer=optimizer, scheduler=scheduler, loader=train_loader,
-            device=device, scaler=scaler, grad_accum=grad_accum,
-            grad_clip=grad_clip, log_every=log_every, epoch=epoch,
-            writer=writer, wandb_run=wandb_run, global_step=global_step,
+            device=device, scaler=scaler, mixed_precision=mp,
+            grad_accum=grad_accum, grad_clip=grad_clip, log_every=log_every,
+            epoch=epoch, writer=writer, wandb_run=wandb_run, global_step=global_step,
         )
         print(f"[Epoch {epoch:3d}] train_loss={train_loss:.4f}")
 

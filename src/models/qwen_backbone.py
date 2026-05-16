@@ -71,8 +71,15 @@ class QwenBackbone(nn.Module):
             **model_kwargs,
         )
 
-        # Infer d_vlm from the model config
-        self.d_vlm: int = self.model.config.hidden_size
+        # Infer d_vlm from the model config.
+        # Qwen2.5-VL stores the LM hidden size under text_config, not top-level.
+        _cfg = self.model.config
+        self.d_vlm: int = (
+            getattr(_cfg, "hidden_size", None)
+            or getattr(getattr(_cfg, "text_config", None), "hidden_size", None)
+            or getattr(getattr(_cfg, "language_config", None), "hidden_size", None)
+            or 3584  # Qwen2.5-VL-7B fallback
+        )
 
         if freeze:
             self._freeze()

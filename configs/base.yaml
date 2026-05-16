@@ -26,6 +26,8 @@ output:
 # ---------------------------------------------------------------
 model:
   backbone: "Qwen/Qwen2.5-VL-7B-Instruct"
+  # dtype for backbone weights. T4 GPUs → float16. Ampere+ → bfloat16.
+  torch_dtype: "float16"
   # d_vlm: hidden dim of backbone (3584 for 7B). Set to null to auto-detect.
   d_vlm: 3584
   # d_dec: hidden dim inside the DETR decoder
@@ -62,8 +64,8 @@ training:
   num_workers: 2
   # Gradient accumulation steps (effective_bs = batch_size * grad_accum)
   grad_accum_steps: 4
-  # Mixed precision: "fp16", "bf16", or "no"
-  mixed_precision: "bf16"
+  # Mixed precision: "fp16" for T4/V100, "bf16" for A100/H100, "no" to disable
+  mixed_precision: "fp16"
   # Gradient clipping max norm
   grad_clip: 1.0
 
