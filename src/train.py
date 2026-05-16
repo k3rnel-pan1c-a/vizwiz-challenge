@@ -40,7 +40,10 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from datasets.vizwiz_answertherapy import VizWizAnswerTherapyDataset, collate_fn, build_datasets
+from datasets.vizwiz_answertherapy import (
+    VizWizAnswerTherapyDataset, collate_fn, build_datasets,
+    CachedVizWizDataset, cached_collate_fn,
+)
 from models.qwen_backbone import QwenBackbone
 from models.grounding_head import GroundingHead
 from models.matcher import HungarianMatcher
@@ -99,38 +102,58 @@ def set_seed(seed: int) -> None:
 # Model construction
 # -----------------------------------------------------------------------
 
-def build_model(cfg: dict, device: torch.device) -> tuple[QwenBackbone, GroundingHead]:
-    """Instantiate backbone and grounding head from config."""
+def build_model(
+    cfg: dict,
+    device: torch.device,
+    d_vlm_override: int | None = None,
+) -> tuple[QwenBackbone | None, GroundingHead]:
+    """Instantiate backbone and grounding head from config.
+
+    When d_vlm_override is provided the backbone is skipped entirely
+    (used when training from a pre-extracted feature cache).
+    """
     m = cfg["model"]
     abl = cfg.get("ablation", {})
 
-    _dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-    torch_dtype = _dtype_map.get(m.get("torch_dtype", "float16"), torch.float16)
-
-    max_memory = None
-    max_memory_per_gpu = m.get("max_memory_per_gpu")
-    if max_memory_per_gpu and torch.cuda.is_available():
-        max_memory = {i: max_memory_per_gpu for i in range(torch.cuda.device_count())}
-
-    backbone = QwenBackbone(
-        model_name=m["backbone"],
-        freeze=m.get("freeze_backbone", True),
-        torch_dtype=torch_dtype,
-        device_map=m.get("device_map", "auto"),
-        max_memory=max_memory,
-        attn_implementation=m.get("attn_implementation", "eager"),
-        max_pixels=m.get("max_pixels"),
-        min_pixels=m.get("min_pixels"),
-    )
-
-    d_vlm = m.get("d_vlm") or backbone.d_vlm
-
-    d_dec = abl.get("d_dec") or m.get("d_dec", 256)
+    d_dec      = abl.get("d_dec")       or m.get("d_dec", 256)
     num_layers = abl.get("num_decoder_layers") or m.get("num_decoder_layers", 6)
-    num_queries = m.get("num_queries") or m.get("num_queries_default", 8)
+    num_queries = m.get("num_queries")  or m.get("num_queries_default", 8)
     use_sm = abl.get("use_single_multi_head", True)
     if use_sm is None:
         use_sm = True
+
+    if d_vlm_override is not None:
+        backbone = None
+        d_vlm    = d_vlm_override
+    else:
+        _dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        torch_dtype = _dtype_map.get(m.get("torch_dtype", "float16"), torch.float16)
+
+        max_memory = None
+        if m.get("max_memory_per_gpu") and torch.cuda.is_available():
+            max_memory = {i: m["max_memory_per_gpu"] for i in range(torch.cuda.device_count())}
+
+        backbone = QwenBackbone(
+            model_name=m["backbone"],
+            freeze=m.get("freeze_backbone", True),
+            torch_dtype=torch_dtype,
+            device_map=m.get("device_map", "auto"),
+            max_memory=max_memory,
+            attn_implementation=m.get("attn_implementation", "eager"),
+            max_pixels=m.get("max_pixels"),
+            min_pixels=m.get("min_pixels"),
+        )
+        d_vlm = m.get("d_vlm") or backbone.d_vlm
+
+        # Optional LoRA
+        lora_cfg = m.get("lora", {})
+        if lora_cfg.get("enabled", False) and not m.get("freeze_backbone", True):
+            backbone.enable_lora(
+                r=lora_cfg.get("r", 16),
+                lora_alpha=lora_cfg.get("lora_alpha", 32),
+                lora_dropout=lora_cfg.get("lora_dropout", 0.05),
+                target_modules=lora_cfg.get("target_modules"),
+            )
 
     head = GroundingHead(
         d_vlm=d_vlm,
@@ -141,16 +164,6 @@ def build_model(cfg: dict, device: torch.device) -> tuple[QwenBackbone, Groundin
         dropout=m.get("dropout", 0.1),
         use_single_multi_head=use_sm,
     ).to(device)
-
-    # Optional LoRA
-    lora_cfg = m.get("lora", {})
-    if lora_cfg.get("enabled", False) and not m.get("freeze_backbone", True):
-        backbone.enable_lora(
-            r=lora_cfg.get("r", 16),
-            lora_alpha=lora_cfg.get("lora_alpha", 32),
-            lora_dropout=lora_cfg.get("lora_dropout", 0.05),
-            target_modules=lora_cfg.get("target_modules"),
-        )
 
     return backbone, head
 
@@ -168,13 +181,13 @@ def build_optimizer(cfg: dict, backbone: QwenBackbone, head: GroundingHead) -> t
 
     param_groups = [{"params": head.parameters(), "lr": lr}]
 
-    # If LoRA is enabled, add backbone LoRA params with lower LR
-    try:
-        lora_params = list(backbone.lora_parameters())
-        if lora_params:
-            param_groups.append({"params": lora_params, "lr": lr_lora})
-    except Exception:
-        pass
+    if backbone is not None:
+        try:
+            lora_params = list(backbone.lora_parameters())
+            if lora_params:
+                param_groups.append({"params": lora_params, "lr": lr_lora})
+        except Exception:
+            pass
 
     return torch.optim.AdamW(param_groups, weight_decay=wd, betas=betas)
 
@@ -247,7 +260,7 @@ class CheckpointManager:
 # -----------------------------------------------------------------------
 
 def train_epoch(
-    backbone: QwenBackbone,
+    backbone: QwenBackbone | None,
     head: GroundingHead,
     matcher: HungarianMatcher,
     criterion: GroundingLoss,
@@ -264,7 +277,8 @@ def train_epoch(
     global_step: list[int] | None = None,
 ) -> float:
     head.train()
-    backbone.eval()
+    if backbone is not None:
+        backbone.eval()
 
     total_loss = 0.0
     n_batches = 0
@@ -273,16 +287,18 @@ def train_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False)
     head_dtype = next(head.parameters()).dtype
     for step, batch in enumerate(pbar):
-        images    = batch["images"]
-        questions = batch["questions"]
         gt_boxes  = batch["gt_boxes"]       # list of tensors
         sm_labels = batch["single_multi"].to(device)  # Long[B]
 
-        # ---- Forward through frozen backbone ----
-        hidden, key_pad = backbone(images, questions, device=device)
-        hidden  = hidden.to(device=device, dtype=head_dtype)
+        # ---- Hidden states: from cache or live backbone ----
+        if "hidden" in batch:
+            hidden  = batch["hidden"].to(device=device, dtype=head_dtype)
+            key_pad = batch["key_pad"].to(device)
+        else:
+            hidden, key_pad = backbone(batch["images"], batch["questions"], device=device)
+            hidden  = hidden.to(device=device, dtype=head_dtype)
+            key_pad = key_pad.to(device)
         hidden = _check_nonfinite(hidden, name="backbone hidden states")
-        key_pad = key_pad.to(device)
 
         # ---- Grounding head ----
         out = head(hidden, key_padding_mask=key_pad)
@@ -358,7 +374,7 @@ def train_epoch(
 
 @torch.no_grad()
 def val_epoch(
-    backbone: QwenBackbone,
+    backbone: QwenBackbone | None,
     head: GroundingHead,
     matcher: HungarianMatcher,
     criterion: GroundingLoss,
@@ -372,7 +388,8 @@ def val_epoch(
     global_step: int = 0,
 ) -> tuple[float, dict]:
     head.eval()
-    backbone.eval()
+    if backbone is not None:
+        backbone.eval()
     total_loss = 0.0
     n_batches  = 0
     metrics = GroundingMetrics(iou_thresholds=iou_thresholds, obj_threshold=obj_threshold)
@@ -380,15 +397,17 @@ def val_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch} [val]", leave=False)
     head_dtype = next(head.parameters()).dtype
     for batch in pbar:
-        images    = batch["images"]
-        questions = batch["questions"]
         gt_boxes  = batch["gt_boxes"]
         sm_labels = batch["single_multi"].to(device)
 
-        hidden, key_pad = backbone(images, questions, device=device)
-        hidden  = hidden.to(device=device, dtype=head_dtype)
+        if "hidden" in batch:
+            hidden  = batch["hidden"].to(device=device, dtype=head_dtype)
+            key_pad = batch["key_pad"].to(device)
+        else:
+            hidden, key_pad = backbone(batch["images"], batch["questions"], device=device)
+            hidden  = hidden.to(device=device, dtype=head_dtype)
+            key_pad = key_pad.to(device)
         hidden = _check_nonfinite(hidden, name="backbone hidden states")
-        key_pad = key_pad.to(device)
 
         out = head(hidden, key_padding_mask=key_pad)
         pred_boxes = out["pred_boxes"]
@@ -446,13 +465,15 @@ def val_epoch(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument("--config",    default="configs/base.yaml")
     parser.add_argument("--overrides", nargs="*", default=[])
-    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume",    default=None, help="Checkpoint to resume from")
+    parser.add_argument("--cache_dir", default=None,
+                        help="Directory of pre-extracted features (from cache_features.py). "
+                             "When set the backbone is not loaded, making each epoch ~50× faster.")
     # parse_known_args lets users pass bare key=value overrides without --overrides:
     #   python src/train.py --config configs/base.yaml training.epochs=5
     args, extra = parser.parse_known_args()
-    # Merge explicit --overrides and any bare key=value extras
     all_overrides = (args.overrides or []) + [e for e in extra if "=" in e]
     args.overrides = all_overrides
 
@@ -470,7 +491,6 @@ def main() -> None:
     for d in [out_dir, ckpt_dir, log_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Save config snapshot
     with open(out_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)
 
@@ -490,18 +510,30 @@ def main() -> None:
         )
 
     # ---- Datasets and loaders ----
-    train_ds, val_ds = build_datasets(cfg)
-    print(f"Train samples: {len(train_ds)},  Val samples: {len(val_ds)}")
-
     batch_size  = cfg["training"]["batch_size"]
     num_workers = cfg["training"].get("num_workers", 2)
+
+    using_cache = args.cache_dir is not None
+    if using_cache:
+        cache_dir = Path(args.cache_dir)
+        train_ds = CachedVizWizDataset(cache_dir, "train")
+        val_ds   = CachedVizWizDataset(cache_dir, "val")
+        d_vlm_from_cache = train_ds.d_vlm
+        _coll_fn = cached_collate_fn
+        print(f"Using feature cache at {cache_dir}  (d_vlm={d_vlm_from_cache})")
+    else:
+        train_ds, val_ds = build_datasets(cfg)
+        d_vlm_from_cache = None
+        _coll_fn = collate_fn
+
+    print(f"Train samples: {len(train_ds)},  Val samples: {len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=_coll_fn,
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -509,18 +541,22 @@ def main() -> None:
         batch_size=cfg["eval"].get("batch_size", batch_size),
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=_coll_fn,
         pin_memory=True,
     )
 
     # ---- Model ----
-    backbone, head = build_model(cfg, device)
-    print(f"Backbone d_vlm={backbone.d_vlm},  Head num_queries={head.num_queries}")
+    backbone, head = build_model(cfg, device, d_vlm_override=d_vlm_from_cache)
+    if backbone is not None:
+        print(f"Backbone d_vlm={backbone.d_vlm},  Head num_queries={head.num_queries}")
+    else:
+        print(f"No backbone loaded (cached mode).  d_vlm={d_vlm_from_cache},  Head num_queries={head.num_queries}")
 
     trainable = sum(p.numel() for p in head.parameters() if p.requires_grad)
-    total_bb  = sum(p.numel() for p in backbone.parameters())
     print(f"Trainable params (head): {trainable:,}")
-    print(f"Backbone total params  : {total_bb:,} (frozen={cfg['model'].get('freeze_backbone', True)})")
+    if backbone is not None:
+        total_bb = sum(p.numel() for p in backbone.parameters())
+        print(f"Backbone total params  : {total_bb:,} (frozen={cfg['model'].get('freeze_backbone', True)})")
 
     # ---- Optimizer / Scheduler / Loss ----
     matcher  = HungarianMatcher(**cfg.get("matcher", {}))

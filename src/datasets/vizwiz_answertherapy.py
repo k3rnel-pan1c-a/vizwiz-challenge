@@ -34,6 +34,79 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
+
+# -----------------------------------------------------------------------
+# Cached dataset (uses pre-extracted backbone features)
+# -----------------------------------------------------------------------
+
+class CachedVizWizDataset(Dataset):
+    """Loads pre-extracted backbone features written by cache_features.py.
+
+    Directory layout expected:
+        cache_dir/{split}/{idx:06d}.pt       — {"hidden": Tensor[L, d_vlm], "key_pad": Tensor[L]}
+        cache_dir/{split}_manifest.json      — {"d_vlm": int, "samples": [...]}
+    """
+
+    def __init__(self, cache_dir: str | Path, split: str) -> None:
+        self.feat_dir = Path(cache_dir) / split
+        manifest_path = Path(cache_dir) / f"{split}_manifest.json"
+        with open(manifest_path) as f:
+            data = json.load(f)
+        self.d_vlm   = data["d_vlm"]
+        self.samples = data["samples"]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        meta = self.samples[idx]
+        feat = torch.load(self.feat_dir / f"{idx:06d}.pt", weights_only=True)
+
+        gt_b = meta["gt_boxes"]
+        gt_boxes = torch.tensor(gt_b, dtype=torch.float32) if gt_b else torch.zeros(0, 4)
+
+        return {
+            "hidden":       feat["hidden"],           # [L, d_vlm]  bfloat16
+            "key_pad":      feat["key_pad"],           # [L]  bool
+            "gt_boxes":     gt_boxes,                  # [K, 4]
+            "single_multi": int(meta["single_multi"]),
+            "image_id":     meta["image_id"],
+            "orig_size":    tuple(meta["orig_size"]),
+        }
+
+
+def cached_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate pre-cached features, right-padding sequences to the batch max length."""
+    hidden_list  = [item["hidden"]  for item in batch]   # each [L_i, d_vlm]
+    key_pad_list = [item["key_pad"] for item in batch]   # each [L_i]  bool
+
+    max_len = max(h.shape[0] for h in hidden_list)
+    d_vlm   = hidden_list[0].shape[1]
+    B       = len(batch)
+    dtype   = hidden_list[0].dtype
+
+    hidden_out  = torch.zeros(B, max_len, d_vlm, dtype=dtype)
+    key_pad_out = torch.ones(B, max_len, dtype=torch.bool)   # True = padding
+
+    for i, (h, kp) in enumerate(zip(hidden_list, key_pad_list)):
+        L = h.shape[0]
+        hidden_out[i, :L]  = h
+        key_pad_out[i, :L] = kp
+
+    gt_boxes  = [item["gt_boxes"]     for item in batch]
+    sm_labels = torch.tensor([item["single_multi"] for item in batch], dtype=torch.long)
+    image_ids = [item["image_id"]     for item in batch]
+    orig_sizes = [item["orig_size"]   for item in batch]
+
+    return {
+        "hidden":       hidden_out,    # [B, max_L, d_vlm]
+        "key_pad":      key_pad_out,   # [B, max_L]
+        "gt_boxes":     gt_boxes,
+        "single_multi": sm_labels,
+        "image_ids":    image_ids,
+        "orig_sizes":   orig_sizes,
+    }
+
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.boxes import (
