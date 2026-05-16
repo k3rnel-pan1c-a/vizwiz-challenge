@@ -1,0 +1,135 @@
+# ===================================================================
+# Base configuration for VizWiz AnswerTherapy grounding model
+# ===================================================================
+
+# ---------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------
+data:
+  root: "/kaggle/input/datasets/abdelrhmanshaheen/answer-therapy"
+  train_json: "VizWiz_train.json"
+  val_json: "VizWiz_val.json"
+  # Set to null to skip VQA data; set to filename to include it
+  train_json_extra: "VQA_train.json"
+  val_json_extra: "VQA_val.json"
+  train_img_dir: "train"
+  val_img_dir: "val"
+
+output:
+  dir: "/kaggle/working/outputs"
+  checkpoint_dir: "/kaggle/working/outputs/checkpoints"
+  log_dir: "/kaggle/working/outputs/logs"
+  viz_dir: "/kaggle/working/outputs/visualizations"
+
+# ---------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------
+model:
+  backbone: "Qwen/Qwen2.5-VL-7B-Instruct"
+  # d_vlm: hidden dim of backbone (3584 for 7B). Set to null to auto-detect.
+  d_vlm: 3584
+  # d_dec: hidden dim inside the DETR decoder
+  d_dec: 256
+  # Number of DETR object queries — override dataset-derived N here or set to null
+  # Dataset analysis (analyze_dataset.py) recommends N=8 (max GT=3, p99=2).
+  # Override here for ablations: 8, 10, 16, 20
+  num_queries: 8
+  # Fallback if num_queries is null and analysis has not been run
+  num_queries_default: 8
+  # Number of Transformer decoder layers
+  num_decoder_layers: 6
+  # Number of attention heads in decoder
+  nheads: 8
+  # Dropout in decoder
+  dropout: 0.1
+  # Freeze entire backbone (ViT + LLM layers)
+  freeze_backbone: true
+  # LoRA config (only used when freeze_backbone is false)
+  lora:
+    enabled: false
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj"]
+
+# ---------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------
+training:
+  seed: 42
+  epochs: 30
+  batch_size: 4
+  num_workers: 2
+  # Gradient accumulation steps (effective_bs = batch_size * grad_accum)
+  grad_accum_steps: 4
+  # Mixed precision: "fp16", "bf16", or "no"
+  mixed_precision: "bf16"
+  # Gradient clipping max norm
+  grad_clip: 1.0
+
+  optimizer:
+    type: "AdamW"
+    # LR for decoder / heads
+    lr: 1.0e-4
+    # LR for LoRA params (only if LoRA enabled)
+    lr_lora: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: "cosine"
+    warmup_steps: 100
+    min_lr: 1.0e-6
+
+  # Objectness score threshold used during *validation* to count kept boxes
+  obj_threshold: 0.5
+
+# ---------------------------------------------------------------
+# Loss weights
+# ---------------------------------------------------------------
+loss:
+  lambda_box: 5.0
+  lambda_giou: 2.0
+  lambda_obj: 1.0
+  lambda_sm: 1.0
+
+# ---------------------------------------------------------------
+# Hungarian matching cost weights
+# ---------------------------------------------------------------
+matcher:
+  lambda_l1: 5.0
+  lambda_giou: 2.0
+  lambda_obj: 1.0
+
+# ---------------------------------------------------------------
+# Evaluation / inference
+# ---------------------------------------------------------------
+eval:
+  obj_threshold: 0.5
+  iou_thresholds: [0.3, 0.5]
+  batch_size: 4
+  num_workers: 2
+
+# ---------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------
+logging:
+  use_wandb: false
+  wandb_project: "vizwiz-grounding"
+  wandb_entity: null
+  use_tensorboard: true
+  log_every: 10          # steps
+  eval_every: 1          # epochs
+  save_every: 1          # epochs
+  save_top_k: 3          # keep best k checkpoints by val loss
+
+# ---------------------------------------------------------------
+# Ablation toggles
+# ---------------------------------------------------------------
+ablation:
+  # Whether to include the single/multiple auxiliary head
+  use_single_multi_head: true
+  # Decoder depth choices (overrides model.num_decoder_layers)
+  num_decoder_layers: null
+  # d_dec choices (overrides model.d_dec)
+  d_dec: null
